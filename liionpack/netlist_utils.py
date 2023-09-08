@@ -180,7 +180,7 @@ def setup_circuit(
     # Build data  with ['element type', node1, node2, value]
     netlist = []
 
-    num_Rb = 0
+    num_Rb = 1
     num_V = 0
 
     desc = []
@@ -235,7 +235,8 @@ def setup_circuit(
         bus_nodes = grid[3::3, :]
     else:
         raise ValueError("configuration must be parallel-strings or series-groups")
-
+    
+    num_Rb = 1
     for nodes in bus_nodes:
         for i in range(len(nodes) - 1):
             # netline = []

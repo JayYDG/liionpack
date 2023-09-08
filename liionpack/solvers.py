@@ -42,8 +42,19 @@ class GenericActor:
                 (type(initial_soc) in [float, int])
                 or (type(initial_soc) is list and len(initial_soc) == 1)
                 or (type(initial_soc) is np.ndarray and len(initial_soc) == 1)
-            ):
-                _, _ = lp.update_init_conc(parameter_values, initial_soc, update=True)
+            ):  
+                if isinstance(parameter_values["Electrode height [m]"], pybamm.expression_tree.input_parameter.InputParameter):
+                    parameter_values_2 = parameter_values.copy()
+                    parameter_values_2["Electrode height [m]"] = 1
+                    c_s_n_init, c_s_p_init = lp.update_init_conc(parameter_values_2, initial_soc, update=True)
+                    parameter_values.update(
+                        {
+                            "Initial concentration in negative electrode [mol.m-3]": c_s_n_init,
+                            "Initial concentration in positive electrode [mol.m-3]": c_s_p_init,
+                        }
+                    )
+                else:
+                    _, _ = lp.update_init_conc(parameter_values, initial_soc, update=True)
             else:
                 lp.logger.warning(
                     "Using a list or an array of initial_soc "
@@ -153,6 +164,10 @@ class GenericManager:
         self.V_map = netlist["desc"].str.find("V") > -1
         self.I_map = netlist["desc"].str.find("I") > -1
         self.Terminal_Node = np.array(netlist[self.I_map].node1)
+        try:
+            self.Terminal_Node2 = np.array(netlist[self.I_map].node2)
+        except:
+            pass
         self.Nspm = np.sum(self.V_map)
 
         self.split_models(self.Nspm, nproc)
@@ -271,7 +286,10 @@ class GenericManager:
         if step <= self.Nsteps:
             V_node, I_batt = lp.solve_circuit_vectorized(self.netlist)
             self.record_times[step] = step * self.dt
-            self.V_terminal[step] = V_node[self.Terminal_Node][0]
+            if self.Terminal_Node2 is None:
+                self.V_terminal[step] = V_node[self.Terminal_Node][0]
+            else:
+                self.V_terminal[step] = V_node[self.Terminal_Node][0] - V_node[self.Terminal_Node2][0]
         if step < self.Nsteps - 1:
             # igore last step save the new currents and build inputs
             # for the next step
