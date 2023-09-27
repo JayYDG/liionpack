@@ -278,7 +278,7 @@ class GenericManager:
         ]
         self.all_output["double"] = self.shm_double
         for j in range(self.Nvar):
-            self.all_output[self.variable_names[j]] = self.output[j, : self.step + 1, :]
+            self.all_output[self.variable_names[j].replace('[', 'cell [')] = self.output[j, : self.step + 1, :]
         return self.all_output
 
     def _step(self, step, updated_inputs):
