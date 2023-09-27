@@ -153,9 +153,13 @@ class GenericManager:
         initial_soc,
         nproc,
         setup_only=False,
+        dtheta=None,
+        double=False
     ):
         self.netlist = netlist
         self.sim_func = sim_func
+        self.double = double
+        self.dthta = dtheta
 
         self.parameter_values = parameter_values
         self.check_current_function()
@@ -179,6 +183,11 @@ class GenericManager:
         netlist.loc[self.I_map, ("value")] = self.protocol[0]
         # Solve the circuit to initialise the electrochemical models
         V_node, I_batt = lp.solve_circuit_vectorized(netlist)
+        I_batt_act = np.copy(I_batt)
+        if double and dtheta:
+            n = int(360/dtheta)
+            I_batt_act[n:-n] = I_batt[n:-n] / 2
+
 
         # The simulation output variables calculated at each step for each battery
         # Must be a 0D variable i.e. battery wide volume average - or X-averaged for
@@ -195,12 +204,22 @@ class GenericManager:
         self.Nvar = len(self.variable_names)
 
         # Storage variables for simulation data
-        self.shm_i_app = np.zeros([self.Nsteps, self.Nspm], dtype=np.float32)
-        self.shm_Ri = np.zeros([self.Nsteps, self.Nspm], dtype=np.float32)
+        # shm_i_app: current calculated from solving netlist
+        # shi_Ri: internal resistance calculated by abs(ocv - v_term)/i_cell
+        # shm_i_act: simulation current, for doule sided cells, the shm_i_app/2
+        # shi_Ri_act: resistance for netlist, for double sided cells, Ri = shi_Ri*2
+        self.shm_i_netlist = np.zeros([self.Nsteps, self.Nspm], dtype=np.float32)
+        self.shm_i_cell = np.zeros([self.Nsteps, self.Nspm], dtype=np.float32)
+        self.shm_Ri_cell = np.zeros([self.Nsteps, self.Nspm], dtype=np.float32)
+        self.shm_Ri_netlist = np.zeros([self.Nsteps, self.Nspm], dtype=np.float32)
+        self.shm_double = np.ones(self.Nspm, dtype=int)
         self.output = np.zeros([self.Nvar, self.Nsteps, self.Nspm], dtype=np.float32)
+        if double and dtheta:
+            self.shm_double[n:-n] = 2
 
         # Initialize currents in battery models
-        self.shm_i_app[0, :] = I_batt * -1
+        self.shm_i_netlist[0, :] = I_batt * -1
+        self.shm_i_cell[0, :] = I_batt_act * -1
 
         # Step forward in time
         self.V_terminal = np.zeros(self.Nsteps, dtype=np.float32)
@@ -211,7 +230,7 @@ class GenericManager:
 
         # Handle the inputs
         self.inputs = inputs
-        self.inputs_dict = lp.build_inputs_dict(self.shm_i_app[0, :], self.inputs, None)
+        self.inputs_dict = lp.build_inputs_dict(self.shm_i_cell[0, :], self.inputs, None)
         # Solver specific setup
         self.setup_actors(nproc, self.inputs_dict, initial_soc)
         # Get the initial state of the system
@@ -242,16 +261,22 @@ class GenericManager:
 
     def step_output(self):
         self.cleanup()
-        self.shm_Ri = np.abs(self.shm_Ri)
+        self.shm_Ri_cell = np.abs(self.shm_Ri_cell)
+        self.shm_Ri_netlist = np.abs(self.shm_Ri_netlist)
         # Collect outputs
         self.all_output = {}
         self.all_output["Time [s]"] = self.record_times[: self.step + 1]
         self.all_output["Pack current [A]"] = np.asarray(self.protocol[: self.step + 1])
         self.all_output["Pack terminal voltage [V]"] = self.V_terminal[: self.step + 1]
-        self.all_output["Cell current [A]"] = self.shm_i_app[: self.step + 1, :]
-        self.all_output["Cell internal resistance [Ohm]"] = self.shm_Ri[
+        self.all_output["Cell current netlist [A]"] = self.shm_i_netlist[: self.step + 1, :]
+        self.all_output["Cell current cell [A]"] = self.shm_i_cell[: self.step + 1, :]
+        self.all_output["Cell internal resistance netlist [Ohm]"] = self.shm_Ri_netlist[
             : self.step + 1, :
         ]
+        self.all_output["Cell internal resistance cell [Ohm]"] = self.shm_Ri_cell[
+            : self.step + 1, :
+        ]
+        self.all_output["double"] = self.shm_double
         for j in range(self.Nvar):
             self.all_output[self.variable_names[j]] = self.output[j, : self.step + 1, :]
         return self.all_output
@@ -276,15 +301,21 @@ class GenericManager:
         # so for now just don't recalculate it.
         if not self.resting and not self.restarting:
             self.temp_Ri = self.calculate_internal_resistance(step)
-        self.shm_Ri[step, :] = self.temp_Ri
+        self.shm_Ri_cell[step, :] = self.temp_Ri
+        # for two parallel cells, the resistance is half
+        self.shm_Ri_netlist[step, :] = self.temp_Ri / self.shm_double
         # 04 Update netlist
         self.netlist.loc[self.V_map, ("value")] = temp_ocv
-        self.netlist.loc[self.Ri_map, ("value")] = self.temp_Ri
+        self.netlist.loc[self.Ri_map, ("value")] = self.temp_Ri / self.shm_double
         self.netlist.loc[self.I_map, ("value")] = self.protocol[step]
         lp.power_loss(self.netlist)
         # 05 Solve the circuit with updated netlist
         if step <= self.Nsteps:
             V_node, I_batt = lp.solve_circuit_vectorized(self.netlist)
+            I_batt_act = np.copy(I_batt)
+            if self.double:
+                n = int(360/self.dthta)
+                I_batt_act[n:-n] = I_batt[n:-n] / 2
             self.record_times[step] = step * self.dt
             if self.Terminal_Node2 is None:
                 self.V_terminal[step] = V_node[self.Terminal_Node][0]
@@ -294,9 +325,15 @@ class GenericManager:
             # igore last step save the new currents and build inputs
             # for the next step
             I_app = I_batt[:] * -1
-            self.shm_i_app[step, :] = I_app
-            self.shm_i_app[step + 1, :] = I_app
-            self.inputs_dict = lp.build_inputs_dict(I_app, self.inputs, updated_inputs)
+            I_batt_act = I_batt_act[:] * -1
+
+            self.shm_i_netlist[step, :] = I_app
+            self.shm_i_netlist[step + 1, :] = I_app
+
+            self.shm_i_cell[step, :] = I_batt_act
+            self.shm_i_cell[step + 1, :] = I_batt_act
+
+            self.inputs_dict = lp.build_inputs_dict(I_batt_act, self.inputs, updated_inputs)
         # 06 Check if voltage limits are reached and terminate
         if np.any(temp_v < self.v_cut_lower):
             lp.logger.warning("Low voltage limit reached")
@@ -333,7 +370,7 @@ class GenericManager:
         # Calculate internal resistance and update netlist
         temp_v = self.output[0, step, :]
         temp_ocv = self.output[1, step, :]
-        temp_I = self.shm_i_app[step, :]
+        temp_I = self.shm_i_cell[step, :]
         temp_Ri = np.abs((temp_ocv - temp_v) / temp_I)
         return temp_Ri
 
